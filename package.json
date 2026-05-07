@@ -1,0 +1,20 @@
+{
+  "name": "boleto-segunda-via",
+  "version": "1.0.0",
+  "description": "Sistema de Segunda Via de Boletos",
+  "main": "boleto-server.js",
+  "scripts": {
+    "start": "node boleto-server.js",
+    "dev": "node boleto-server.js"
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.5.1",
+    "mssql": "^10.0.0",
+    "nodemailer": "^6.9.7",
+    "pdf-parse": "^2.4.5",
+    "uuid": "^9.0.0"
+  }
+}
