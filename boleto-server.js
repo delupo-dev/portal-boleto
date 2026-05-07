@@ -1,5 +1,5 @@
 const express = require('express');
-const sql = require('mssql');
+const { Pool } = require('pg');
 const nodemailer = require('nodemailer');
 const path = require('path');
 const crypto = require('crypto');
@@ -37,18 +37,14 @@ const lookupLimiter = rateLimit({
 // Aplicar limite geral em todas as rotas
 app.use(generalLimiter);
 
-// ─── DB CONFIG ───────────────────────────────────────────────────────────────
-const sqlConfig = {
-  user: process.env.DB_USER || 'dev',
+// ─── DB CONFIG (PostgreSQL) ───────────────────────────────────────────────────
+const pool = new Pool({
+  user: process.env.DB_USER || 'postgres',
+  host: process.env.DB_SERVER || 'localhost',
+  database: process.env.DB_NAME || 'postgres',
   password: process.env.DB_PASSWORD || '',
-  server: process.env.DB_SERVER || 'localhost',
-  database: process.env.DB_NAME || '',
-  port: parseInt(process.env.DB_PORT || '1433'),
-  options: {
-    encrypt: false,
-    trustServerCertificate: true
-  }
-};
+  port: parseInt(process.env.DB_PORT || '5432'),
+});
 
 // ─── EMAIL CONFIG ─────────────────────────────────────────────────────────────
 // Configure your SMTP here. Example uses Gmail App Password.
@@ -91,8 +87,9 @@ app.use((err, req, res, next) => {
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 function formatCGC(raw) {
-  if (!raw || typeof raw !== 'string') return '';
-  const digits = raw.replace(/\D/g, '');
+  if (raw === null || raw === undefined) return '';
+  const str = String(raw);
+  const digits = str.replace(/\D/g, '');
   return digits;
 }
 
@@ -100,7 +97,7 @@ function maskEmail(emailStr) {
   if (!emailStr) return '';
   // Split by semicolon or comma to handle multiple emails
   const emails = emailStr.split(/[;,]/).map(e => e.trim()).filter(e => e.includes('@'));
-  
+
   if (emails.length === 0) return emailStr;
 
   const masked = emails.map(e => {
@@ -120,11 +117,7 @@ function generateToken() {
 }
 
 // ─── POOL HELPER ──────────────────────────────────────────────────────────────
-async function getPool() {
-  const pool = new sql.ConnectionPool(sqlConfig);
-  await pool.connect();
-  return pool;
-}
+// ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 // ─── ROUTE: Lookup CGC → return masked email ──────────────────────────────────
 // POST /api/boleto/lookup
@@ -138,35 +131,32 @@ app.post('/api/boleto/lookup', lookupLimiter, async (req, res) => {
     return res.status(400).json({ error: 'CPF/CNPJ inválido.' });
   }
 
-  let pool;
   try {
-    pool = await getPool();
-    const request = pool.request();
-    request.input('cgc', sql.VarChar, digits);
+    console.log(`[LOOKUP] Iniciando busca para CGC: ${digits}`);
+    const result = await pool.query(`
+      SELECT 
+        cliente as nm_cliente,
+        cgc,
+        email_boleto as email
+      FROM boletos
+      WHERE regexp_replace(cgc, '[^0-9]', '', 'g') = $1
+      LIMIT 1
+    `, [digits]);
 
-    // Look up the client email from the cliente table
-    const result = await request.query(`
-      SELECT TOP 1 
-        c.nm_cliente,
-        c.cgc,
-        COALESCE(NULLIF(c.email_boleto,''), NULLIF(c.email_nfe,''), NULLIF(c.email,''), NULLIF(c.contato_email1,'')) AS email
-      FROM cliente c
-      WHERE REPLACE(REPLACE(REPLACE(c.cgc, '.', ''), '-', ''), '/', '') = @cgc
-        AND COALESCE(NULLIF(c.email_boleto,''), NULLIF(c.email_nfe,''), NULLIF(c.email,''), NULLIF(c.contato_email1,'')) IS NOT NULL
-    `);
-
-    if (!result.recordset || result.recordset.length === 0) {
+    if (!result.rows || result.rows.length === 0) {
+      console.warn(`[LOOKUP] Nenhum registro encontrado para CGC: ${digits}`);
       return res.status(404).json({ error: 'Cliente não encontrado ou sem email cadastrado.' });
     }
 
-    const cliente = result.recordset[0];
+    const cliente = result.rows[0];
+    console.log(`[LOOKUP] Sucesso. Cliente: ${cliente.nm_cliente}, Email: ${cliente.email}`);
+    
     const maskedEmail = maskEmail(cliente.email);
 
-    // Store pending verification
     pendingVerifications.set(digits, {
       email: cliente.email,
       name: cliente.nm_cliente,
-      expires: Date.now() + 10 * 60 * 1000 // 10 min
+      expires: Date.now() + 10 * 60 * 1000 
     });
 
     return res.json({
@@ -175,10 +165,8 @@ app.post('/api/boleto/lookup', lookupLimiter, async (req, res) => {
       cgc: digits
     });
   } catch (err) {
-    console.error('Erro lookup:', err);
+    console.error('[LOOKUP] Erro crítico no banco de dados:', err);
     return res.status(500).json({ error: 'Erro ao consultar cliente.', detail: err.message });
-  } finally {
-    if (pool) pool.close();
   }
 });
 
@@ -202,7 +190,7 @@ app.post('/api/boleto/send-link', lookupLimiter, async (req, res) => {
   const typed = emailDigitado.trim().toLowerCase();
 
   if (!registeredEmails.includes(typed)) {
-    return res.status(400).json({ 
+    return res.status(400).json({
       error: 'O email informado não coincide com o nosso cadastro.',
       code: 'EMAIL_MISMATCH'
     });
@@ -297,84 +285,48 @@ app.get('/api/boleto/list', generalLimiter, async (req, res) => {
     return res.status(401).json({ error: 'Link expirado ou inválido.' });
   }
 
-  let pool;
   try {
-    pool = await getPool();
-    const request = pool.request();
-    request.input('cgc', sql.VarChar, session.cgc);
-
-    const result = await request.query(`
+    console.log(`[LIST] Buscando boletos para CGC: ${session.cgc}`);
+    const result = await pool.query(`
       SELECT 
-        t.cd_empresa_venda,
-        t.situacao AS [ID_SITUACAO],
-        CASE 
-          WHEN t.situacao = 'PR ' THEN 'Pendente de registro' 
-          WHEN t.situacao = 'GR'  THEN 'Gerado Remessa'
-          WHEN t.situacao = 'RE'  THEN 'Registrado' 
-          WHEN t.situacao = 'RR'  THEN 'Retorno de registro rejeitado'
-          WHEN t.situacao = 'PC'  THEN 'Pendente de cancelamento' 
-          WHEN t.situacao = 'GC'  THEN 'Gerado remessa de cancelamento'
-          WHEN t.situacao = 'CA'  THEN 'Cancelado' 
-          WHEN t.situacao = 'PG'  THEN 'Pago'
-        END AS TIPO_SITUACAO,
-        b.nm_fantasia AS NOME_BANCO,
-        b.nr_banco_bc + '-' + b.digito_bc AS NR_BANCO,
-        t.linha_digitavel AS LINHA_DIGITAVEL,
-        CONVERT(VARCHAR(10), t.dt_vencimento, 103) AS VENCIMENTO,
-        CONVERT(VARCHAR(10), t.dt_emissao, 103) AS DATA_DOCUMENTO,
-        b.local_pgto AS LOCAL_PAGAMENTO,
-        b.aceite AS ACEITE,
-        'DM' AS ESPECIE_DOC,
-        CONCAT(a.cd_agencia, '-', a.digito_agencia, '/', a.nr_conta, '-', a.digito_cc) AS AGENCIA_COD_BENEFICIARIO,
-        t.nosso_numero AS NOSSO_NUMERO,
-        t.vl_boleto AS VALOR_DOCUMENTO,
-        t.cd_carteira AS CD_CARTEIRA,
-        CONCAT(t.nr_titulo, '/', t.sequencia) AS NUMERO_DOCUMENTO,
-        'R$' AS ESPECIE_MOEDA,
-        CONVERT(VARCHAR(10), tr.dt_pgto, 103) AS DATA_PAGAMENTO,
-        tr.vl_pago AS VALOR_PAGO,
-        CONCAT(c.cd_cliente, ' - ', c.nm_cliente) AS CLIENTE,
-        CONCAT(
-          c.endereco_cobranca, ', ', c.nro_endereco_cobranca, ' - ',
-          c.bairro_cobranca, ' ', c.cep_cobranca, ' ',
-          ci.nm_cidade, '-', ci.uf
-        ) AS ENDERECO,
-        c.cgc AS CGC,
-        REPLACE(
-          a.ds_mensagem_boleto_multa_juro,
-          '<juro>',
-          'R$ ' + REPLACE(REPLACE(CONVERT(VARCHAR, CAST((t.vl_boleto * a.percentual_juros) / 100 AS MONEY), 1), ',', 'X'), '.', ',')
-        ) AS MENSAGEM_CALCULADA,
-        CONCAT(
-          e.nm_empresa, ' - ', e.endereco, ', ', e.bairro, ', ',
-          ci2.nm_cidade, '/', ci2.uf, ' - ', e.cep
-        ) AS BENEFICIARIO
-      FROM titulo_receber_boleto t
-      INNER JOIN titulo_receber tr ON t.cd_empresa = tr.cd_empresa 
-                                 AND t.cd_documento = tr.cd_documento 
-                                 AND t.nr_titulo = tr.nr_titulo 
-                                 AND t.sequencia = tr.sequencia
-      INNER JOIN banco b        ON t.cd_banco = b.cd_banco  
-      INNER JOIN banco_agencia a ON t.cd_banco = a.cd_banco AND t.nr_conta = a.nr_conta  
-      INNER JOIN cliente c       ON t.cd_cliente = c.cd_cliente AND t.cd_empresa_cliente = c.cd_empresa  
-      INNER JOIN cidade ci       ON c.cd_cidade_cobranca = ci.cd_cidade
-      INNER JOIN empresa e       ON t.cd_empresa = e.cd_empresa
-      INNER JOIN cidade ci2      ON e.cd_cidade = ci2.cd_cidade
-      WHERE REPLACE(REPLACE(REPLACE(c.cgc, '.', ''), '-', ''), '/', '') = @cgc
-        AND t.situacao NOT IN ('CA', 'PC')
-      ORDER BY t.dt_vencimento ASC
-    `);
+        id_situacao AS "ID_SITUACAO",
+        tipo_sistuacao AS "TIPO_SITUACAO",
+        nome_banco AS "NOME_BANCO",
+        n_banco AS "NR_BANCO",
+        linha_digitavel AS "LINHA_DIGITAVEL",
+        vencimento AS "VENCIMENTO",
+        data_do_documento AS "DATA_DOCUMENTO",
+        local_de_pagamento AS "LOCAL_PAGAMENTO",
+        aceite AS "ACEITE",
+        especie_doc AS "ESPECIE_DOC",
+        agencia_cod_beneficiario AS "AGENCIA_COD_BENEFICIARIO",
+        nosso_numero AS "NOSSO_NUMERO",
+        __valor_documento AS "VALOR_DOCUMENTO",
+        cd_carteira AS "CD_CARTEIRA",
+        numero_documento AS "NUMERO_DOCUMENTO",
+        especie_moeda AS "ESPECIE_MOEDA",
+        TO_CHAR(data_pagamento::TIMESTAMP, 'DD/MM/YYYY') AS "DATA_PAGAMENTO",
+        valor_pago AS "VALOR_PAGO",
+        cliente AS "CLIENTE",
+        endereco AS "ENDERECO",
+        cgc AS "CGC",
+        mensagem_calculada AS "MENSAGEM_CALCULADA",
+        beneficiario AS "BENEFICIARIO"
+      FROM boletos
+      WHERE regexp_replace(cgc, '[^0-9]', '', 'g') = $1
+      ORDER BY vencimento ASC
+    `, [session.cgc]);
 
-    const allRecords = result.recordset || [];
-    return res.json({ 
+    const allRecords = result.rows || [];
+    console.log(`[LIST] Total de registros encontrados: ${allRecords.length}`);
+
+    return res.json({
       boletos: allRecords.filter(b => b.ID_SITUACAO !== 'PG'),
       historico: allRecords.filter(b => b.ID_SITUACAO === 'PG')
     });
   } catch (err) {
-    console.error('Erro list boletos:', err);
+    console.error('[LIST] Erro ao listar boletos no Postgres:', err);
     return res.status(500).json({ error: 'Erro ao consultar boletos.', detail: err.message });
-  } finally {
-    if (pool) pool.close();
   }
 });
 
@@ -390,71 +342,50 @@ app.get('/api/boleto/detail', async (req, res) => {
   }
 
   // Reuse the list query and pick by index
-  let pool;
   try {
-    pool = await getPool();
-    const request = pool.request();
-    request.input('cgc', sql.VarChar, session.cgc);
-
-    const result = await request.query(`
+    console.log(`[DETAIL] Buscando detalhes do boleto índice ${idx} para CGC: ${session.cgc}`);
+    const result = await pool.query(`
       SELECT 
-        t.situacao AS ID_SITUACAO,
-        b.nm_fantasia AS NOME_BANCO,
-        b.nr_banco_bc + '-' + b.digito_bc AS NR_BANCO,
-        t.linha_digitavel AS LINHA_DIGITAVEL,
-        CONVERT(VARCHAR(10), t.dt_vencimento, 103) AS VENCIMENTO,
-        CONVERT(VARCHAR(10), t.dt_emissao, 103) AS DATA_DOCUMENTO,
-        b.local_pgto AS LOCAL_PAGAMENTO,
-        b.aceite AS ACEITE,
-        'DM' AS ESPECIE_DOC,
-        CONCAT(a.cd_agencia, '-', a.digito_agencia, '/', a.nr_conta, '-', a.digito_cc) AS AGENCIA_COD_BENEFICIARIO,
-        t.nosso_numero AS NOSSO_NUMERO,
-        t.vl_boleto AS VALOR_DOCUMENTO,
-        t.cd_carteira AS CD_CARTEIRA,
-        CONCAT(t.nr_titulo, '/', t.sequencia) AS NUMERO_DOCUMENTO,
-        'R$' AS ESPECIE_MOEDA,
-        c.nm_cliente AS CLIENTE,
-        CONCAT(
-          c.endereco_cobranca, ', ', c.nro_endereco_cobranca, ' - ',
-          c.bairro_cobranca, ', ',
-          ci.nm_cidade, '-', ci.uf, ' CEP: ', c.cep_cobranca
-        ) AS ENDERECO,
-        c.cgc AS CGC,
-        REPLACE(
-          a.ds_mensagem_boleto_multa_juro,
-          '<juro>',
-          'R$ ' + REPLACE(REPLACE(CONVERT(VARCHAR, CAST((t.vl_boleto * a.percentual_juros) / 100 AS MONEY), 1), ',', 'X'), '.', ',')
-        ) AS MENSAGEM_CALCULADA,
-        CONCAT(
-          e.nm_empresa, ' - ', e.endereco, ', ', e.bairro, ', ',
-          ci2.nm_cidade, '/', ci2.uf, ' - CEP: ', e.cep
-        ) AS BENEFICIARIO,
-        e.nm_empresa AS NM_EMPRESA,
-        e.cnpj AS CNPJ_EMPRESA
-      FROM titulo_receber_boleto t
-      INNER JOIN banco b        ON t.cd_banco = b.cd_banco  
-      INNER JOIN banco_agencia a ON t.cd_banco = a.cd_banco AND t.nr_conta = a.nr_conta  
-      INNER JOIN cliente c       ON t.cd_cliente = c.cd_cliente AND t.cd_empresa_cliente = c.cd_empresa  
-      INNER JOIN cidade ci       ON c.cd_cidade_cobranca = ci.cd_cidade
-      INNER JOIN empresa e       ON t.cd_empresa = e.cd_empresa
-      INNER JOIN cidade ci2      ON e.cd_cidade = ci2.cd_cidade
-      WHERE REPLACE(REPLACE(REPLACE(c.cgc, '.', ''), '-', ''), '/', '') = @cgc
-        AND t.situacao NOT IN ('PG', 'CA', 'PC')
-      ORDER BY t.dt_vencimento ASC
-    `);
+        id_situacao AS "ID_SITUACAO",
+        nome_banco AS "NOME_BANCO",
+        n_banco AS "NR_BANCO",
+        linha_digitavel AS "LINHA_DIGITAVEL",
+        vencimento AS "VENCIMENTO",
+        data_do_documento AS "DATA_DOCUMENTO",
+        local_de_pagamento AS "LOCAL_PAGAMENTO",
+        aceite AS "ACEITE",
+        especie_doc AS "ESPECIE_DOC",
+        agencia_cod_beneficiario AS "AGENCIA_COD_BENEFICIARIO",
+        nosso_numero AS "NOSSO_NUMERO",
+        __valor_documento AS "VALOR_DOCUMENTO",
+        cd_carteira AS "CD_CARTEIRA",
+        numero_documento AS "NUMERO_DOCUMENTO",
+        especie_moeda AS "ESPECIE_MOEDA",
+        cliente AS "CLIENTE",
+        endereco AS "ENDERECO",
+        cgc AS "CGC",
+        mensagem_calculada AS "MENSAGEM_CALCULADA",
+        beneficiario AS "BENEFICIARIO",
+        beneficiario AS "NM_EMPRESA"
+      FROM boletos
+      WHERE regexp_replace(cgc, '[^0-9]', '', 'g') = $1
+        AND id_situacao NOT IN ('PG', 'CA', 'PC')
+      ORDER BY vencimento ASC
+    `, [session.cgc]);
 
-    const records = result.recordset || [];
+    const records = result.rows || [];
     const index = parseInt(idx || '0', 10);
+    
     if (index < 0 || index >= records.length) {
+      console.warn(`[DETAIL] Boleto não encontrado para o índice ${index}`);
       return res.status(404).json({ error: 'Boleto não encontrado.' });
     }
 
+    console.log(`[DETAIL] Sucesso. Boleto ${records[index].NUMERO_DOCUMENTO} carregado.`);
     return res.json({ boleto: records[index] });
   } catch (err) {
-    console.error('Erro detail:', err);
+    console.error('[DETAIL] Erro ao buscar detalhe do boleto:', err);
     return res.status(500).json({ error: 'Erro ao buscar boleto.', detail: err.message });
-  } finally {
-    if (pool) pool.close();
   }
 });
 
