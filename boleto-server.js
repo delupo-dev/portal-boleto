@@ -369,7 +369,7 @@ app.get('/api/boleto/detail', async (req, res) => {
         beneficiario AS "NM_EMPRESA"
       FROM boletos
       WHERE regexp_replace(cgc, '[^0-9]', '', 'g') = $1
-        AND id_situacao NOT IN ('PG', 'CA', 'PC')
+        AND id_situacao NOT IN ('PG', 'CA', 'PC', 'GR', 'PR')
       ORDER BY vencimento ASC
     `, [session.cgc]);
 

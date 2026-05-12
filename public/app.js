@@ -367,7 +367,7 @@ function renderBoletos(nome) {
           <div class="vencido-notice" onclick="showContactModal()" style="cursor:pointer;">
             Entre em contato com o financeiro para atualizar seu boleto.
           </div>
-        ` : (b.ID_SITUACAO || '').trim() === 'PR' ? `
+        ` : ['PR', 'GR'].includes((b.ID_SITUACAO || '').trim()) ? `
           <div class="vencido-notice" style="color: #6B7280; background: #F3F4F6; border-color: #D1D5DB;">
             Aguardando registro no banco.
           </div>
